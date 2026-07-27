@@ -65,7 +65,7 @@ pkgdata_DATA = Fritzing2Kicad.pdf
 TCLKIT = $(top_builddir)/BuildData/tclkit${BEXEEXT}
 BUILT_SOURCES = $(TCLKIT)
 
-Fritzing2Kicad$(EXEEXT) : Scripts/Fritzing2Kicad.tcl \
+Fritzing2Kicad$(EXEEXT) : $(TCLKIT) Scripts/Fritzing2Kicad.tcl \
 	$(Fritzing2KicadLib) ExtraDoc/Version.tcl
 	-rm -rf Fritzing2Kicad.vfs
 	$(TCLKIT) $(top_srcdir)/BuildScripts/sdx.kit qwrap $(srcdir)/Scripts/Fritzing2Kicad.tcl
