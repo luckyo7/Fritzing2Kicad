@@ -419,11 +419,23 @@ snit::type FritzingPart {
         global argv
         global argv0
         
-        if {$argv > 0} {
+        if {$argc > 0} {
             set filename [lindex $argv 0]
-            
+
             set fpz [$type create [file rootname [file tail $filename]] $filename]
             puts stdout [format {%s loaded: %s} $filename [$fpz toString]]
+        } else {
+            # When wrapped as a starpack argv0 is the internal main.tcl, so
+            # prefer the executable's own name and fall back to argv0 when
+            # running under a plain tclsh.
+            set progname [file tail [info nameofexecutable]]
+            if {[string match {tclsh*} $progname] ||
+                [string match {tclkit*} $progname] ||
+                [string match {wish*} $progname]} {
+                set progname [file tail $argv0]
+            }
+            puts stderr [format {Usage: %s fzpfile} $progname]
+            exit 1
         }
         exit 0
     }
