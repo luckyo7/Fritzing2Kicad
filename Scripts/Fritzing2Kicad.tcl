@@ -43,6 +43,9 @@
 
 package require snit
 package require ParseXML
+package require FzpzArchive
+package require KicadConverter
+package require FootprintConverter
 
 snit::type FritzingView {
     option -metafilename -default {} -readonly yes
@@ -414,32 +417,258 @@ snit::type FritzingPart {
                 [$iconView toString]]
     }
     
-    typeconstructor {
-        global argc
-        global argv
-        global argv0
-        
-        if {$argc > 0} {
-            set filename [lindex $argv 0]
+    typemethod ProgramName {} {
+        ## Method to work out what to call ourselves in messages.  When wrapped
+        # as a starpack argv0 is the wrapper's internal main.tcl, so prefer the
+        # executable's own name and fall back to argv0 under a plain tclsh.
+        # @return The program name.
 
-            set fpz [$type create [file rootname [file tail $filename]] $filename]
-            puts stdout [format {%s loaded: %s} $filename [$fpz toString]]
-        } else {
-            # When wrapped as a starpack argv0 is the internal main.tcl, so
-            # prefer the executable's own name and fall back to argv0 when
-            # running under a plain tclsh.
-            set progname [file tail [info nameofexecutable]]
-            if {[string match {tclsh*} $progname] ||
-                [string match {tclkit*} $progname] ||
-                [string match {wish*} $progname]} {
-                set progname [file tail $argv0]
-            }
-            puts stderr [format {Usage: %s fzpfile} $progname]
-            exit 1
+        set progname [file tail [info nameofexecutable]]
+        if {[string match {tclsh*} $progname] ||
+            [string match {tclkit*} $progname] ||
+            [string match {wish*} $progname]} {
+            set progname [file tail $::argv0]
         }
-        exit 0
+        return $progname
     }
-    
+
+    typemethod Usage {channel} {
+        ## Method to print the usage message.
+        # @param channel The channel to print it on.
+
+        set progname [$type ProgramName]
+        puts $channel [format {Usage: %s [options] <part.fzp|part.fzpz> [output.kicad_sym]} $progname]
+        puts $channel {}
+        puts $channel {Convert a Fritzing part into a KiCad schematic symbol and footprint.}
+        puts $channel {}
+        puts $channel {Options:}
+        puts $channel {  -o, --output FILE   Write the symbol to FILE.}
+        puts $channel {      --footprint FILE Write the footprint to FILE.}
+        puts $channel {      --no-symbol     Do not write a symbol.}
+        puts $channel {      --no-footprint  Do not write a footprint.}
+        puts $channel {      --name NAME     Name the symbol NAME instead of using the part title.}
+        puts $channel {      --reference REF Use REF as the reference designator prefix.}
+        puts $channel {      --info          Describe the part instead of converting it.}
+        puts $channel {  -h, --help          Print this message.}
+        puts $channel {      --version       Print the version.}
+        puts $channel {}
+        puts $channel {With no output files both are written next to the input, with}
+        puts $channel {.kicad_sym and .kicad_mod extensions.}
+    }
+
+    typemethod Main {arguments} {
+        ## The command line entry point.
+        # @param arguments The command line arguments.
+        # @return The exit status.
+
+        set output {}
+        set footprint {}
+        set wantsymbol yes
+        set wantfootprint yes
+        set name {}
+        set reference {}
+        set describe no
+        set inputs [list]
+        set literal no
+
+        for {set i 0} {$i < [llength $arguments]} {incr i} {
+            set argument [lindex $arguments $i]
+            if {$literal} {
+                lappend inputs $argument
+                continue
+            }
+            switch -exact -- $argument {
+                -o -
+                --output {set output [lindex $arguments [incr i]]}
+                --footprint {set footprint [lindex $arguments [incr i]]}
+                --no-symbol {set wantsymbol no}
+                --no-footprint {set wantfootprint no}
+                --name {set name [lindex $arguments [incr i]]}
+                --reference {set reference [lindex $arguments [incr i]]}
+                --info {set describe yes}
+                -h -
+                --help {$type Usage stdout; return 0}
+                --version {
+                    puts stdout [format {%s %s} [$type ProgramName] [$type Version]]
+                    return 0
+                }
+                -- {set literal yes}
+                default {
+                    if {[string match {-*} $argument]} {
+                        puts stderr [format {%s: unknown option %s} \
+                                     [$type ProgramName] $argument]
+                        $type Usage stderr
+                        return 2
+                    }
+                    lappend inputs $argument
+                }
+            }
+        }
+
+        # A second bare argument is the output file, which is how most
+        # converters are invoked.
+        if {[llength $inputs] == 2 && $output eq {}} {
+            set output [lindex $inputs 1]
+            set inputs [lrange $inputs 0 0]
+        }
+        if {[llength $inputs] != 1} {
+            $type Usage stderr
+            return 2
+        }
+
+        set input [lindex $inputs 0]
+        if {![file readable $input]} {
+            puts stderr [format {%s: cannot read %s} [$type ProgramName] $input]
+            return 1
+        }
+
+        # A .fzpz is a zip archive; unpack it and work from what comes out.
+        set archive {}
+        if {[string tolower [file extension $input]] eq {.fzpz}} {
+            if {[catch {FzpzArchive %AUTO% $input} archive]} {
+                $type Complain $archive
+                return 1
+            }
+            set fzpfile [$archive FzpFile]
+            set partsdirectory [$archive PartsDirectory]
+        } else {
+            set fzpfile $input
+            set partsdirectory [file dirname $input]
+        }
+
+        set status [catch {
+            $type Run [dict create input $input fzpfile $fzpfile \
+                       partsdirectory $partsdirectory output $output \
+                       footprint $footprint wantsymbol $wantsymbol \
+                       wantfootprint $wantfootprint name $name \
+                       reference $reference describe $describe]
+        } result]
+        if {$archive ne {}} {$archive destroy}
+        if {$status} {
+            $type Complain $result
+            return 1
+        }
+        return $result
+    }
+
+    typemethod Run {settings} {
+        ## Load the part and either describe or convert it.
+        # @param settings A dict of everything the command line asked for.
+        # @return The exit status.
+
+        set input [dict get $settings input]
+        set part [$type create %AUTO% [dict get $settings fzpfile] \
+                  -partsdirectory [dict get $settings partsdirectory]]
+
+        if {[string is true -strict [dict get $settings describe]]} {
+            puts stdout [format {%s loaded: %s} $input [$part toString]]
+            return 0
+        }
+
+        set name [dict get $settings name]
+        set footprintfile [dict get $settings footprint]
+        set wantfootprint [string is true -strict [dict get $settings wantfootprint]]
+        set wantsymbol [string is true -strict [dict get $settings wantsymbol]]
+
+        # The footprint comes first so the symbol can point at it.
+        set footprintname {}
+        if {$wantfootprint} {
+            set options [list]
+            if {$name ne {}} {lappend options -name $name}
+            set footprint [FootprintConverter convert $part {*}$options]
+            if {[$footprint padCount] == 0} {
+                $type Report [FootprintConverter warnings]
+                puts stderr [format {%s: no footprint written, the part has no pads} \
+                             [$type ProgramName]]
+                set wantfootprint no
+            } else {
+                if {$footprintfile eq {}} {
+                    set footprintfile [format {%s.kicad_mod} [file rootname $input]]
+                }
+                $footprint write $footprintfile
+                set footprintname [$type FootprintId $footprintfile]
+                $type Report [FootprintConverter warnings]
+                puts stdout [format {%s -> %s (%d pads)} \
+                             $input $footprintfile [$footprint padCount]]
+            }
+        }
+
+        if {$wantsymbol} {
+            set options [list]
+            if {$name ne {}} {lappend options -name $name}
+            if {[dict get $settings reference] ne {}} {
+                lappend options -reference [dict get $settings reference]
+            }
+            set symbol [KicadConverter convert $part {*}$options]
+            if {$footprintname ne {}} {
+                $symbol configure -footprint $footprintname
+            }
+            set output [dict get $settings output]
+            if {$output eq {}} {
+                set output [format {%s.kicad_sym} [file rootname $input]]
+            }
+            $symbol write $output
+            $type Report [KicadConverter warnings]
+            puts stdout [format {%s -> %s (%d pins)} $input $output [$symbol pinCount]]
+        }
+        return 0
+    }
+
+    typemethod FootprintId {footprintfile} {
+        ## Work out how a symbol should refer to a footprint.  KiCad names a
+        # footprint after its file, qualified by the nickname of the .pretty
+        # directory holding it.  Written anywhere else there is no library to
+        # name, so the bare file name is the best that can be offered and the
+        # user assigns the library themselves.
+        # @param footprintfile The footprint file that was written.
+        # @return The footprint identifier.
+
+        set base [file rootname [file tail $footprintfile]]
+        set directory [file tail [file dirname [file normalize $footprintfile]]]
+        if {[string match {*.pretty} $directory]} {
+            return [format {%s:%s} [file rootname $directory] $base]
+        }
+        return $base
+    }
+
+    typemethod Report {warnings} {
+        ## Print a converter's warnings on stderr.
+        # @param warnings The warnings.
+
+        foreach warning $warnings {
+            puts stderr [format {%s: warning: %s} [$type ProgramName] $warning]
+        }
+    }
+
+    typemethod Complain {message} {
+        ## Report a failure on stderr.
+        # @param message The error message.
+
+        # Every nested snit constructor adds its own prefix, which says nothing
+        # useful by the time the message reaches the command line.
+        regsub -all {Error in constructor: } $message {} message
+        puts stderr [format {%s: %s} [$type ProgramName] [string trim $message]]
+    }
+
+    typemethod Version {} {
+        ## Method to return the version, which is only bundled in a built
+        # executable.
+        # @return The version string.
+        if {[catch {package require Version} version]} {return {(unreleased)}}
+        return $version
+    }
+
+    typeconstructor {
+        # This file is wrapped twice: once as the application package the
+        # executable starts, and once alongside the libraries, where the
+        # build's pkg_mkIndex pass sources it.  Only the application copy, or a
+        # copy named directly on a tclsh command line, should run the program.
+        if {[info script] eq $::argv0 ||
+            [string match {app-*} [file tail [file dirname [info script]]]]} {
+            exit [$type Main $::argv]
+        }
+    }
+
 }
 
         
