@@ -300,7 +300,10 @@ snit::type ParseXML {
     # @param data The text enclosed by an element.
 #    puts stderr "*** $self _characterdata: nodeStack = $nodeStack"
     set curnode [lindex $nodeStack end]
-    $curnode setdata $data
+    # The parser hands long text over in several pieces, splitting it at each
+    # entity reference, so the pieces have to be joined rather than replace one
+    # another.
+    $curnode setdata "[$curnode data]$data"
   }
   method displayTree {{fp stdout}} {
       ## @publicsection Display the XML tree.
